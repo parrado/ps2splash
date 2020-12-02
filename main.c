@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include "about.h"
 #include "OSDInit.h"
+#include "spng.h"
 
 #define NTSC 2
 #define PAL 3
@@ -40,9 +41,9 @@ typedef enum
 } gs_video_mode;
 
 int width, height;
-png_byte color_type;
-png_byte bit_depth;
-png_bytep *row_pointers = NULL;
+spng_ctx *ctx = NULL;
+struct spng_ihdr ihdr;
+FILE *fdn;
 
 void delay(u64 msec)
 {
@@ -107,71 +108,23 @@ void LoadElf(const char *elf, char *path)
 
 void read_png_file(char *filename)
 {
-	FILE *fp = fopen(filename, "rb");
-	int y;
+	FILE *fdn = fopen(filename, "rb");
+	ctx = spng_ctx_new(0);
+	/* Ignore and don't calculate chunk CRC's */
+	spng_set_crc_action(ctx, SPNG_CRC_USE, SPNG_CRC_USE);
 
-	png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-	if (!png)
-		abort();
+	/* Set memory usage limits for storing standard and unknown chunks,
+       this is important when reading arbitrary files! */
+	size_t limit = 1024 * 1024 * 64;
+	spng_set_chunk_limits(ctx, limit, limit);
 
-	png_infop info = png_create_info_struct(png);
-	if (!info)
-		abort();
+	/* Set source PNG */
+	spng_set_png_file(ctx, fdn); /* or _buffer(), _stream() */
 
-	if (setjmp(png_jmpbuf(png)))
-		abort();
+	spng_get_ihdr(ctx, &ihdr);
 
-	png_init_io(png, fp);
-
-	png_read_info(png, info);
-
-	width = png_get_image_width(png, info);
-	height = png_get_image_height(png, info);
-	color_type = png_get_color_type(png, info);
-	bit_depth = png_get_bit_depth(png, info);
-
-	// Read any color_type into 8bit depth, RGBA format.
-	// See http://www.libpng.org/pub/png/libpng-manual.txt
-
-	if (bit_depth == 16)
-		png_set_strip_16(png);
-
-	if (color_type == PNG_COLOR_TYPE_PALETTE)
-		png_set_palette_to_rgb(png);
-
-	// PNG_COLOR_TYPE_GRAY_ALPHA is always 8 or 16bit depth.
-	if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
-		png_set_expand_gray_1_2_4_to_8(png);
-
-	if (png_get_valid(png, info, PNG_INFO_tRNS))
-		png_set_tRNS_to_alpha(png);
-
-	// These color_type don't have an alpha channel then fill it with 0xff.
-	if (color_type == PNG_COLOR_TYPE_RGB ||
-		color_type == PNG_COLOR_TYPE_GRAY ||
-		color_type == PNG_COLOR_TYPE_PALETTE)
-		png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-
-	if (color_type == PNG_COLOR_TYPE_GRAY ||
-		color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
-		png_set_gray_to_rgb(png);
-
-	png_read_update_info(png, info);
-
-	if (row_pointers)
-		abort();
-
-	row_pointers = (png_bytep *)malloc(sizeof(png_bytep) * height);
-	for (y = 0; y < height; y++)
-	{
-		row_pointers[y] = (png_byte *)malloc(png_get_rowbytes(png, info));
-	}
-
-	png_read_image(png, row_pointers);
-
-	fclose(fp);
-
-	png_destroy_read_struct(&png, &info, NULL);
+	width = ihdr.width;
+	height = ihdr.height;
 }
 
 int file_exists(char filepath[])
@@ -190,9 +143,9 @@ int main(int argc, char *argv[])
 {
 
 	uint32_t *splash;
-	int y, x;
-	double red,green,blue,alpha;
-	uint8_t ored,ogreen,oblue;
+	uint8_t *out;
+	uint8_t *aux;
+	int x, r;
 
 	InitPS2();
 	scr_clear();
@@ -248,10 +201,13 @@ int main(int argc, char *argv[])
 		}
 		else
 		{
-			/* Allocate buffer storage */
-			int size = width * height;
+			size_t out_size, out_width;
 
-			splash = (uint32_t *)memalign(16, size * sizeof(uint32_t));
+			int fmt = SPNG_FMT_RGBA8;
+
+			r = spng_decoded_image_size(ctx, fmt, &out_size);
+
+			splash = (uint32_t *)memalign(16, out_size);
 			if (splash == NULL)
 			{
 				scr_printf(" Error allocating temporary data buffer, is image too big?\n");
@@ -259,25 +215,30 @@ int main(int argc, char *argv[])
 				abort();
 			}
 
-			for (y = 0; y < height; y++)
+			spng_decode_image(ctx, NULL, 0, fmt, SPNG_DECODE_PROGRESSIVE);
+
+			/* ihdr.height will always be non-zero if spng_get_ihdr() succeeds */
+			out_width = out_size / height;
+
+			struct spng_row_info row_info = {0};
+
+			out = splash;
+
+			do
 			{
-				png_bytep row = row_pointers[y];
+				r = spng_get_row_info(ctx, &row_info);
+				if (r)
+					break;
+				aux = out + row_info.row_num * out_width;
+				spng_decode_row(ctx, aux, out_width);
+
 				for (x = 0; x < width; x++)
 				{
-					png_bytep px = &(row[x * 4]);
-
-					alpha=(double)px[3]/255.0;
-					red=(double)px[2]/255.0;
-					green=(double)px[1]/255.0;
-					blue=(double)px[0]/255.0;
-
-					ored =  (alpha * red)*255;
-					ogreen = (alpha * green)*255;
-					oblue =  (alpha * blue)*255;
-					
-					splash[y * width + x] = (ored << 16) | (ogreen << 8) | (oblue << 0);
+					aux[4 * x + 2] = (uint16_t)aux[4 * x + 2] * (uint16_t)aux[4 * x + 3] / 255;
+					aux[4 * x + 1] = (uint16_t)aux[4 * x + 1] * (uint16_t)aux[4 * x + 3] / 255;
+					aux[4 * x + 0] = (uint16_t)aux[4 * x + 0] * (uint16_t)aux[4 * x + 3] / 255;
 				}
-			}
+			} while (!r);
 
 			// clear the screen
 			gs_set_fill_color(0x00, 0x00, 0x0);
@@ -287,6 +248,9 @@ int main(int argc, char *argv[])
 			gs_print_bitmap((gs_get_max_x() - width) / 2, (gs_get_max_y() - height) / 2, width, height, splash); // print centered splash bitmap
 
 			gs_print_bitmap((gs_get_max_x() - about_w), (gs_get_max_y() - about_h), about_w, about_h, about);
+
+			delay(DELAY);
+			free(splash);
 		}
 	}
 
@@ -294,8 +258,6 @@ int main(int argc, char *argv[])
 	{
 		scr_printf(" ps2splash.png could not be found in mc0 neither mc1\n");
 	}
-
-	delay(DELAY);
 
 	int osdsys_exists(char filepath[])
 	{
@@ -424,8 +386,8 @@ int main(int argc, char *argv[])
 		LoadElf("mc0:/APPS/WLE.ELF", "mc0:/APPS/");
 	if (file_exists("mc0:/BOOT/WLE.ELF"))
 		LoadElf("mc0:/BOOT/WLE.ELF", "mc0:/BOOT/");
-	if (file_exists("mc1:/BOOT/BOOT.ELF"))
-		LoadElf("mc1:/BOOT/BOOT.ELF", "mc1:/BOOT/");
+	if (file_exists("mc1:/BOOT/BOOT2.ELF"))
+		LoadElf("mc1:/BOOT/BOOT2.ELF", "mc1:/BOOT/");
 	if (file_exists("mc1:/FORTUNA/BOOT2.ELF"))
 		LoadElf("mc1:/FORTUNA/BOOT2.ELF", "mc1:/FORTUNA/");
 	if (file_exists("mc1:/APPS/BOOT.ELF"))
@@ -671,8 +633,8 @@ int main(int argc, char *argv[])
 			LoadElf("mc0:/APPS/WLE.ELF", "mc0:/APPS/");
 		if (file_exists("mc0:/BOOT/WLE.ELF"))
 			LoadElf("mc0:/BOOT/WLE.ELF", "mc0:/BOOT/");
-		if (file_exists("mc1:/BOOT/BOOT.ELF"))
-			LoadElf("mc1:/BOOT/BOOT.ELF", "mc1:/BOOT/");
+		if (file_exists("mc1:/BOOT/BOOT2.ELF"))
+			LoadElf("mc1:/BOOT/BOOT2.ELF", "mc1:/BOOT/");
 		if (file_exists("mc1:/FORTUNA/BOOT2.ELF"))
 			LoadElf("mc1:/FORTUNA/BOOT2.ELF", "mc1:/FORTUNA/");
 		if (file_exists("mc1:/APPS/BOOT.ELF"))
